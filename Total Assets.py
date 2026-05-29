@@ -4,6 +4,7 @@ from requests.auth import HTTPBasicAuth
 import pandas as pd
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from collections import defaultdict
 import logging
 import sys
 
@@ -16,6 +17,9 @@ CERT_PATH = "/path/to/your/corporate_cert.pem"  # or False to skip SSL verify
 BASE_URL  = "https://qualysapi.qg1.apps.qualys.in"
 PAGE_SIZE = 100
 # ============================================================
+
+# Qualys flattened path for EC2 Instance ID
+EC2_RAW_COL = "sourceInfo.list.Ec2AssetSourceSimple.instanceId"
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("QualysFullAssetExtractor")
@@ -55,15 +59,10 @@ class QualysFullAssetExtractor:
         log.info("Logged out.")
 
     def _build_request(self, offset: int) -> bytes:
-        """
-        No <fields> block and no <filters> block = Qualys returns
-        every asset and every field available in the XML response.
-        """
         root  = ET.Element("ServiceRequest")
         prefs = ET.SubElement(root, "preferences")
         ET.SubElement(prefs, "startFromOffset").text = str(offset)
         ET.SubElement(prefs, "limitResults").text    = str(PAGE_SIZE)
-        # ← intentionally no <fields> or <filters> here
         return ET.tostring(root, encoding="utf-8")
 
     def fetch_all_hosts(self) -> list:
@@ -95,27 +94,15 @@ class QualysFullAssetExtractor:
         return results
 
     def _flatten_element(self, element: ET.Element, prefix: str = "") -> dict:
-        """
-        Recursively walk every XML element under a HostAsset and flatten
-        it into a single dict of {column_name: value}.
-
-        Rules:
-        - Leaf nodes (no children, has text)  → key = "Parent.Child", value = text
-        - List nodes (repeated child tags)    → values joined with " | "
-        - Nested objects                      → keep drilling with dot-notation prefix
-        """
-        result = {}
+        result   = {}
         children = list(element)
 
         if not children:
-            # Leaf node
             text = (element.text or "").strip()
             if prefix:
                 result[prefix] = text
             return result
 
-        # Group children by tag to detect repeated elements (lists)
-        from collections import defaultdict
         tag_groups = defaultdict(list)
         for child in children:
             tag_groups[child.tag].append(child)
@@ -124,30 +111,23 @@ class QualysFullAssetExtractor:
             col_name = f"{prefix}.{tag}" if prefix else tag
 
             if len(siblings) > 1:
-                # Repeated tag → treat as a list, join leaf values with " | "
                 values = []
                 for sib in siblings:
                     leaf_vals = self._flatten_element(sib, "").values()
                     values.append(", ".join(v for v in leaf_vals if v))
                 result[col_name] = " | ".join(values)
             else:
-                child = siblings[0]
+                child        = siblings[0]
                 grandchildren = list(child)
                 if not grandchildren:
-                    # Simple leaf
                     result[col_name] = (child.text or "").strip()
                 else:
-                    # Nested object — recurse
                     nested = self._flatten_element(child, col_name)
                     result.update(nested)
 
         return result
 
     def build_rows(self, hosts: list) -> pd.DataFrame:
-        """
-        One row per HostAsset. Every XML field becomes its own column.
-        Columns are union of all keys seen across all assets (missing = blank).
-        """
         rows = []
         for host in hosts:
             row = self._flatten_element(host)
@@ -155,10 +135,31 @@ class QualysFullAssetExtractor:
 
         df = pd.DataFrame(rows)
 
-        # Sort columns: put the most common / identifying ones first
-        priority = ["id", "dnsHostName", "netbiosName", "fqdn", "address", "os",
-                    "operatingSystem", "trackingMethod", "type", "created", "modified",
-                    "lastVulnScan", "lastSystemBoot"]
+        # ── EC2 Instance ID: promote to a clean top-level column ──────────
+        # Non-EC2 assets will simply have a blank value here.
+        if EC2_RAW_COL in df.columns:
+            df.insert(0, "EC2 Instance ID", df[EC2_RAW_COL])
+            log.info(
+                f"EC2 Instance ID populated for "
+                f"{df['EC2 Instance ID'].astype(bool).sum()} / {len(df)} assets."
+            )
+        else:
+            # Column absent entirely — no EC2 assets in this pull, or field
+            # path differs; check _flatten_element output in the column summary.
+            df.insert(0, "EC2 Instance ID", "")
+            log.warning(
+                f"'{EC2_RAW_COL}' not found in response. "
+                "EC2 Instance ID column will be blank. "
+                "Run with log level DEBUG and inspect the raw XML to confirm the path."
+            )
+
+        # Sort columns: identifying ones first
+        priority = [
+            "EC2 Instance ID", "id", "dnsHostName", "netbiosName", "fqdn",
+            "address", "os", "operatingSystem", "trackingMethod", "type",
+            "created", "modified", "lastVulnScan", "lastSystemBoot",
+            EC2_RAW_COL,          # keep the raw column too for traceability
+        ]
         front = [c for c in priority if c in df.columns]
         rest  = [c for c in df.columns if c not in front]
         df    = df[front + sorted(rest)]
@@ -179,14 +180,12 @@ class QualysFullAssetExtractor:
         thin        = Side(style="thin", color="CCCCCC")
         cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-        # Header row
         for cell in ws[1]:
             cell.fill      = PatternFill("solid", fgColor="1F4E79")
             cell.font      = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.border    = cell_border
 
-        # Data rows — alternating row shading
         for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
             fill = PatternFill("solid", fgColor="EBF3FB") if i % 2 == 0 else None
             for cell in row:
@@ -196,10 +195,9 @@ class QualysFullAssetExtractor:
                 if fill:
                     cell.fill = fill
 
-        # Auto-fit column widths (capped at 60)
         for idx, col in enumerate(df.columns, 1):
-            col_vals  = df.iloc[:, idx - 1].astype(str).map(len)
-            max_len   = max(col_vals.max() if not df.empty else 0, len(str(col)))
+            col_vals = df.iloc[:, idx - 1].astype(str).map(len)
+            max_len  = max(col_vals.max() if not df.empty else 0, len(str(col)))
             ws.column_dimensions[get_column_letter(idx)].width = min(max_len + 4, 60)
 
         ws.freeze_panes    = "A2"
@@ -219,7 +217,7 @@ class QualysFullAssetExtractor:
             log.info("\n=== COLUMN SUMMARY ===")
             for col in df.columns:
                 non_blank = df[col].astype(bool).sum()
-                log.info(f"  {col:<55} filled: {non_blank}/{len(df)}")
+                log.info(f"  {col:<60} filled: {non_blank}/{len(df)}")
 
             self.export(df)
         finally:
