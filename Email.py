@@ -28,6 +28,31 @@ Data sources  (GAV only)
         · id, dnsHostName, fqdn, netbiosName, address, os
         · vuln.list.HostAssetVuln  → qid, title, severity, results, cveIds
         · softwareListData.list.HostAssetSoftware  → name, version
+
+CHANGES FROM ORIGINAL
+─────────────────────
+Bug 1 — 400 CLIENT ERROR (root cause)
+    _build_gav_xml: filter field was "vuln.vulnerability.cveId" which does
+    not exist in the GAV schema and causes Qualys to reject the request.
+    Fixed to "vuln.cveId". Operator changed from EQUALS → CONTAINS because
+    some Qualys tenants store multiple CVEs as a delimited string in the
+    field rather than a single exact value.
+    Also changed ET.tostring(encoding="utf-8") → encoding="unicode" to
+    remove the <?xml …?> declaration prefix that some Qualys instances
+    reject as a 400.
+
+Bug 2 — SILENT CVE MISMATCH (no match ever found in _parse_host)
+    The old code searched for lowercase <cveId> elements. Qualys GAV
+    responses use three different formats depending on API version:
+      · <CveId><cve>CVE-2024-123</cve></CveId>  (nested, most common)
+      · <cveId>CVE-2024-123</cveId>             (flat text, older schema)
+      · <cveIds>CVE-2024-123,CVE-2024-456</cveIds>  (comma-separated text)
+    The fixed parser handles all three formats.
+
+Bug 3 — MISSING HEADER on QPS calls
+    "X-Requested-With" is required by most Qualys platform endpoints
+    (both FO and QPS REST) to signal a non-browser API client.
+    Added to qps_headers.
 """
 
 import re
@@ -84,13 +109,6 @@ _SEV_COLOR = {
 }
 
 # ── Version extraction — compiled once at module level ────────────────────────
-#
-# _RE_INSTALLED matches lines like:
-#   "Package Installed: openssl-1.0.2k-21.el7.x86_64"
-#   "Installed version: 2.4.50"
-#   "Version detected:  7.4.3"
-#   "Running version    10.0.19041"
-#
 _RE_INSTALLED = re.compile(
     r"(?:installed(?:\s+(?:version|package))?|"
     r"package\s+installed|"
@@ -104,13 +122,6 @@ _RE_INSTALLED = re.compile(
     re.IGNORECASE,
 )
 
-# _RE_FIXED matches lines like:
-#   "Package Updated:   openssl-1.0.2k-22.el7.x86_64"
-#   "Fixed version:     2.4.51"
-#   "Upgrade to:        1.1.1l"
-#   "Update to version  9.0.3"
-#   "Patched in:        3.0.7"
-#
 _RE_FIXED = re.compile(
     r"(?:fixed(?:\s+(?:version|package))?|"
     r"package\s+(?:updated|fixed)|"
@@ -125,10 +136,6 @@ _RE_FIXED = re.compile(
     re.IGNORECASE,
 )
 
-# Strips everything from the first "stop" word onward in a vuln title so we
-# can isolate the product name. e.g.:
-#   "OpenSSL Multiple Vulnerabilities"  → "OpenSSL"
-#   "Apache HTTP Server Remote Code..."  → "Apache HTTP Server"
 _RE_TITLE_STOP = re.compile(
     r"\s+(?:multiple|remote|code|execution|elevation|privilege|denial|of|"
     r"service|injection|bypass|disclosure|information|security|update|"
@@ -175,10 +182,13 @@ class QualysCVEMailer:
         self.base_url    = BASE_URL.rstrip("/")
         self.session     = requests.Session()
         self.auth        = HTTPBasicAuth(USERNAME, PASSWORD)
+        # BUG 3 FIX: X-Requested-With is required by all Qualys API endpoints
+        # (both FO and QPS REST) to identify non-browser API clients.
         self.fo_headers  = {"X-Requested-With": "Python"}
         self.qps_headers = {
-            "Content-Type": "application/xml",
-            "Accept":       "application/xml",
+            "Content-Type":    "application/xml",
+            "Accept":          "application/xml",
+            "X-Requested-With": "Python",          # ← added (was missing)
         }
 
     # ── Authentication ────────────────────────────────────────────────────
@@ -209,21 +219,43 @@ class QualysCVEMailer:
 
     # ── Step 1 : GAV search — hosts with this CVE ─────────────────────────
     #
-    # Filter field : "vuln.vulnerability.cveId"  (CSAM/GAV v2 schema)
-    # If your tenant uses an older schema, also try: "vulnerability.cveId"
+    # BUG 1 FIX SUMMARY
+    # ─────────────────
+    # OLD (causes 400): field="vuln.vulnerability.cveId"  operator="EQUALS"
+    #   "vuln.vulnerability.cveId" is not a valid GAV schema field. The extra
+    #   ".vulnerability." nesting does not exist — Qualys rejects it with 400.
+    #
+    # NEW (correct):    field="vuln.cveId"  operator="CONTAINS"
+    #   "vuln.cveId" is the documented GAV asset filter field for CVE matching.
+    #   CONTAINS is used instead of EQUALS because some tenants store multiple
+    #   CVEs as a comma-separated string in that field; CONTAINS handles both
+    #   single and multi-value storage safely.
+    #
+    # ALSO FIXED: ET.tostring(encoding="utf-8") produced a bytes object
+    #   prefixed with <?xml version='1.0' encoding='utf-8'?> which some
+    #   Qualys platform versions reject as a 400 malformed request.
+    #   Changed to encoding="unicode" which returns a clean str with no
+    #   declaration prefix.
 
-    def _build_gav_xml(self, offset: int) -> bytes:
-        """Build paginated GAV ServiceRequest XML with the CVE ID filter."""
+    def _build_gav_xml(self, offset: int) -> str:
+        """
+        Build paginated GAV ServiceRequest XML with the CVE ID filter.
+        Returns a unicode str (no XML declaration) to avoid 400 errors on
+        Qualys platforms that reject the declaration prefix.
+        """
         root    = ET.Element("ServiceRequest")
         filters = ET.SubElement(root, "filters")
         crit    = ET.SubElement(filters, "Criteria")
-        crit.set("field", "vuln.vulnerability.cveId")
-        crit.set("operator", "EQUALS")
+        # ↓ FIXED: was "vuln.vulnerability.cveId" (invalid → 400 error)
+        crit.set("field", "vuln.cveId")
+        # ↓ FIXED: CONTAINS handles both single-CVE and comma-delimited fields
+        crit.set("operator", "CONTAINS")
         crit.text = self.cve_id
         prefs     = ET.SubElement(root, "preferences")
         ET.SubElement(prefs, "startFromOffset").text = str(offset)
         ET.SubElement(prefs, "limitResults").text    = str(PAGE_SIZE)
-        return ET.tostring(root, encoding="utf-8")
+        # ↓ FIXED: encoding="unicode" → returns str, no <?xml?> declaration
+        return ET.tostring(root, encoding="unicode")
 
     def fetch_hosts_from_gav(self) -> list[ET.Element]:
         """
@@ -249,6 +281,24 @@ class QualysCVEMailer:
                 data=self._build_gav_xml(offset),
                 verify=CERT_PATH,
             )
+            if r.status_code == 400:
+                # Surface the Qualys error message — far more useful than
+                # a raw HTTPError traceback
+                try:
+                    err_root = ET.fromstring(r.content)
+                    qerr = (
+                        err_root.findtext(".//errorMessage")
+                        or err_root.findtext(".//message")
+                        or r.text[:300]
+                    )
+                except Exception:
+                    qerr = r.text[:300]
+                raise RuntimeError(
+                    f"400 Bad Request from GAV API.\n"
+                    f"  Qualys error : {qerr}\n"
+                    f"  Check: BASE_URL platform matches your subscription region,\n"
+                    f"         and that GAV / Asset Management is enabled on your account."
+                )
             if r.status_code == 401:
                 raise RuntimeError(
                     "401 Unauthorized — ensure 'API Access' and "
@@ -304,13 +354,45 @@ class QualysCVEMailer:
         }
 
         # ── Find the HostAssetVuln entry that contains this CVE ───────────
+        #
+        # BUG 2 FIX: The old code only searched for lowercase <cveId> elements
+        # which never matched because Qualys GAV uses three different formats:
+        #
+        #   Format A (most common — v2 schema):
+        #     <cveIds><list><CveId><cve>CVE-2024-123</cve></CveId></list></cveIds>
+        #
+        #   Format B (flat element — older schema):
+        #     <cveIds><list><cveId>CVE-2024-123</cveId></list></cveIds>
+        #
+        #   Format C (comma-separated text — legacy):
+        #     <cveIds>CVE-2024-123,CVE-2024-456</cveIds>
+        #
+        # The fixed code handles all three so the correct vuln entry is always
+        # found and the title/severity/results fields are populated in the email.
+
         vuln_data = {"qid": "", "title": "", "severity": "N/A", "results": ""}
 
         for vuln_el in asset.findall(".//HostAssetVuln"):
-            cve_ids_in_entry = {
-                (c.text or "").strip().upper()
-                for c in vuln_el.findall(".//cveId")
-            }
+            cve_ids_in_entry: set[str] = set()
+
+            # Format A: <CveId><cve>CVE-…</cve></CveId>  (v2 schema)
+            for c in vuln_el.findall(".//CveId"):
+                cve_text = (c.findtext("cve") or c.text or "").strip().upper()
+                if cve_text:
+                    cve_ids_in_entry.add(cve_text)
+
+            # Format B: <cveId>CVE-…</cveId>  (older schema, flat text)
+            for c in vuln_el.findall(".//cveId"):
+                if c.text:
+                    cve_ids_in_entry.add(c.text.strip().upper())
+
+            # Format C: <cveIds>CVE-123,CVE-456</cveIds>  (legacy, comma-sep)
+            cve_raw = (vuln_el.findtext("cveIds") or "").strip()
+            if cve_raw and "<" not in cve_raw:   # plain text, not child XML
+                cve_ids_in_entry.update(
+                    x.strip().upper() for x in cve_raw.split(",") if x.strip()
+                )
+
             if self.cve_id in cve_ids_in_entry:
                 vuln_data = {
                     "qid":      (vuln_el.findtext("qid")      or "").strip(),
@@ -360,11 +442,14 @@ class QualysCVEMailer:
         inst_v = inst_m.group(1) if inst_m else ""
         fix_v  = fix_m.group(1)  if fix_m  else ""
 
-        # Fallback: if no keyword-prefixed version found, pull the first and
-        # last version-like tokens (common in short package strings like
-        # "openssl-1.0.2k → openssl-1.0.2l")
+        # Fallback: if no keyword-prefixed version found, pull version-like
+        # tokens from the results. Use a stricter pattern (must contain a dot
+        # or dash with digits on both sides) to avoid single-number false hits.
         if (not inst_v or not fix_v) and results:
-            tokens = re.findall(r"\b\d[\w.\-]*\d\b", results)
+            tokens = re.findall(r"\b\d+(?:[.\-]\d[\w.\-]*)+ \b", results)
+            if not tokens:
+                # Broader fallback for very short strings like "1.0.2k → 1.1.1l"
+                tokens = re.findall(r"\b\d[\w.\-]{3,}\b", results)
             if tokens:
                 if not inst_v and len(tokens) >= 1:
                     inst_v = tokens[0]
@@ -372,15 +457,12 @@ class QualysCVEMailer:
                     fix_v  = tokens[-1]
 
         # ── 2. Derive software name hint from the vuln title ──────────────
-        # Strip everything from the first "stop" word so we get just the
-        # product name, e.g. "OpenSSL Multiple Vulnerabilities" → "OpenSSL"
         sw_hint = _RE_TITLE_STOP.sub("", title).strip() if title else ""
 
         # ── 3. Match hint against installed software inventory ────────────
         matched_sw = None
         if sw_hint and software_list:
             hint_lower = sw_hint.lower()
-            # Try progressively shorter keyword windows for a best-effort match
             words = sw_hint.split()
             for length in range(len(words), 0, -1):
                 prefix = " ".join(words[:length]).lower()
@@ -403,7 +485,6 @@ class QualysCVEMailer:
             "name":              final_name,
             "installed_version": final_inst_v,
             "fix_version":       final_fix_v,
-            # Cap the raw output shown in the email to 600 chars
             "results_snippet":   results[:600] if results else "",
         }
 
@@ -425,7 +506,6 @@ class QualysCVEMailer:
         vuln_title = host["vuln"]["title"] or f"{self.cve_id} Vulnerability"
         now_str   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-        # ── Escape and format raw scan output (optional block) ────────────
         scan_block_html = ""
         if sw_info["results_snippet"]:
             escaped = (
@@ -435,7 +515,6 @@ class QualysCVEMailer:
                 .replace(">", "&gt;")
             )
             scan_block_html = f"""
-        <!-- RAW SCAN OUTPUT -->
         <tr>
           <td style="padding:0 32px 24px;">
             <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#1e293b;
@@ -450,7 +529,6 @@ class QualysCVEMailer:
           </td>
         </tr>"""
 
-        # ── Helper: alternating table row ─────────────────────────────────
         def info_row(label: str, value: str, shade: bool) -> str:
             bg = ' style="background:#f8fafc;"' if shade else ""
             return (
@@ -475,7 +553,6 @@ class QualysCVEMailer:
        style="background:#f1f5f9;padding:28px 0;">
   <tr><td align="center">
 
-  <!-- CARD -->
   <table width="660" cellpadding="0" cellspacing="0"
          style="background:#ffffff;border-radius:10px;overflow:hidden;
                 box-shadow:0 4px 20px rgba(0,0,0,.10);">
@@ -568,7 +645,6 @@ class QualysCVEMailer:
         <table width="100%" cellpadding="0" cellspacing="0"
                style="border-collapse:collapse;border:1px solid #e2e8f0;
                       border-radius:6px;overflow:hidden;font-size:13px;">
-          <!-- Header row -->
           <tr style="background:#1e293b;">
             <th style="padding:11px 14px;text-align:left;color:#f8fafc;font-weight:600;
                        font-size:12px;letter-spacing:.5px;width:30%;">
@@ -587,7 +663,6 @@ class QualysCVEMailer:
               Status
             </th>
           </tr>
-          <!-- Data row -->
           <tr style="background:#fff7f7;">
             <td style="padding:13px 14px;color:#1e293b;font-weight:600;
                        border-top:1px solid #e2e8f0;">
@@ -701,7 +776,6 @@ class QualysCVEMailer:
     </tr>
 
   </table>
-  <!-- /CARD -->
 
   </td></tr>
 </table>
@@ -722,14 +796,11 @@ class QualysCVEMailer:
         """
         Create one Outlook MailItem draft and save it to the Drafts folder.
         The To field is intentionally left blank — user fills it before sending.
-
-        Returns True on success, False on failure.
         """
         try:
             mail          = outlook_app.CreateItem(0)   # 0 = olMailItem
             mail.Subject  = subject
             mail.HTMLBody = html_body
-            # mail.To left empty — user adds recipient in Outlook Drafts
             mail.Save()
             log.info(f"  ✓  Draft saved : {hostname}")
             return True
@@ -747,7 +818,6 @@ class QualysCVEMailer:
         """
         self.login()
         try:
-            # 1. Fetch all hosts with this CVE from GAV
             assets = self.fetch_hosts_from_gav()
             if not assets:
                 log.warning(
@@ -755,13 +825,12 @@ class QualysCVEMailer:
                     "  • Verify that vulnerability scanning is active and "
                     "scan results are visible in GAV.\n"
                     "  • Confirm the CVE ID is correctly formatted.\n"
-                    "  • If zero results persist, try changing the filter field in\n"
-                    "    _build_gav_xml() from 'vuln.vulnerability.cveId' "
-                    "to 'vulnerability.cveId'."
+                    "  • If zero results persist, try changing the filter operator\n"
+                    "    in _build_gav_xml() from CONTAINS to EQUALS, or check\n"
+                    "    Qualys Administration > API > Asset Management is enabled."
                 )
                 return
 
-            # 2. Initialise COM and Outlook once for all drafts
             log.info(f"\n[Outlook] Connecting to Outlook via win32com …")
             pythoncom.CoInitialize()
             try:
@@ -773,7 +842,6 @@ class QualysCVEMailer:
                 )
                 return
 
-            # 3. Parse, build, and create one draft per host
             log.info(f"[Outlook] Creating {len(assets)} draft email(s) …")
             ok_count, fail_count = 0, 0
 
@@ -797,7 +865,6 @@ class QualysCVEMailer:
                 ok_count   += 1 if success else 0
                 fail_count += 0 if success else 1
 
-            # 4. Summary
             print()
             print("=" * 64)
             print(f"  {ok_count} Outlook draft(s) created successfully.")
