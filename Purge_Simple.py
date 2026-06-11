@@ -186,9 +186,25 @@ def get_dead_instance_dicts(
 
 
 # ─────────────────────────── FETCH ALL HOSTS ───────────────────────────
-def build_request(offset: int) -> bytes:
-    """Build paginated XML request for fetching hosts."""
+def build_ec2_fetch_request(offset: int) -> bytes:
+    """
+    Build a paginated XML request filtered to EC2 assets only.
+
+    Adds a Criteria filter so Qualys skips every host that has no EC2
+    instance ID — meaning only cloud-managed EC2 assets come back.
+    For a mixed inventory of 50,000 hosts where, say, 10,000 are EC2,
+    this cuts the page count from 50 → 10 before a single line of
+    Python matching runs.
+    """
     root = ET.Element("ServiceRequest")
+
+    # ── EC2-only filter ──────────────────────────────────────────────
+    filters = ET.SubElement(root, "filters")
+    criteria = ET.SubElement(filters, "Criteria")
+    criteria.set("field", "sourceInfo.list.Ec2AssetSourceSimple.instanceId")
+    criteria.set("operator", "IS_NOT_EMPTY")
+    # ────────────────────────────────────────────────────────────────
+
     preferences = ET.SubElement(root, "preferences")
     ET.SubElement(preferences, "startFromOffset").text = str(offset)
     ET.SubElement(preferences, "limitResults").text = str(PAGE_SIZE)
@@ -196,7 +212,13 @@ def build_request(offset: int) -> bytes:
 
 
 def fetch_all_hosts(session: requests.Session) -> List[ET.Element]:
-    """Fetch all HostAsset records from Qualys with pagination."""
+    """
+    Fetch EC2 HostAsset records from Qualys with pagination.
+
+    The request is now filtered server-side to EC2 assets only, so the
+    number of pages is proportional to your EC2 inventory, not your
+    total Qualys inventory.
+    """
     url = f"{BASE_URL}/qps/rest/2.0/search/am/hostasset"
     auth = HTTPBasicAuth(USERNAME, PASSWORD)
     offset = 1
@@ -204,12 +226,12 @@ def fetch_all_hosts(session: requests.Session) -> List[ET.Element]:
     all_hosts = []
 
     while True:
-        log.info(f"Fetching page {page} (offset {offset})")
+        log.info(f"Fetching EC2 assets — page {page} (offset {offset})")
         response = session.post(
             url,
             headers={"Content-Type": "application/xml", "Accept": "application/xml"},
             auth=auth,
-            data=build_request(offset),
+            data=build_ec2_fetch_request(offset),
             verify=CERT_PATH
         )
         response.raise_for_status()
@@ -228,7 +250,7 @@ def fetch_all_hosts(session: requests.Session) -> List[ET.Element]:
         offset += PAGE_SIZE
         page += 1
 
-    log.info(f"Total hosts fetched: {len(all_hosts)}")
+    log.info(f"Total EC2 hosts fetched: {len(all_hosts)}")
     return all_hosts
 
 
