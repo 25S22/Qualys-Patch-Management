@@ -151,8 +151,12 @@ def get_dead_instance_dicts(
     status_column: str = "State"
 ) -> List[Dict]:
     """
-    Read all CSV/Excel files from filepath, filter rows where status
-    contains 'stopped' or 'terminated', and return as list of dicts.
+    Read all CSV/Excel files from filepath, return only TERMINATED instances.
+
+    Deliberately excludes 'stopped' instances — stopped instances may be
+    intentionally powered off and restarted later, so purging them from
+    Qualys would cause them to reappear as new untracked assets on next boot.
+    Only 'terminated' instances are permanently gone and safe to purge.
     """
     files_data = {}
     all_data = pd.DataFrame()
@@ -178,102 +182,101 @@ def get_dead_instance_dicts(
         log.warning("No data loaded from input files")
         return []
 
-    pattern = r"stopped|terminated"
-    dead_df = all_data[all_data[status_column].astype(str).str.contains(pattern, case=False, na=False)]
+    # Exact match on "terminated" only — strip whitespace, lowercase both sides
+    # Previously used str.contains("stopped|terminated") which caught stopped too
+    terminated_mask = (
+        all_data[status_column]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        == "terminated"
+    )
+    dead_df     = all_data[terminated_mask]
     result_list = dead_df[[id_column, status_column]].to_dict(orient="records")
-    log.info(f"Total Stopped/Terminated instances from files: {len(result_list)}")
+    log.info(f"Terminated instances found in files: {len(result_list)}")
     return result_list
 
 
 # ─────────────────────────── FETCH ALL HOSTS ───────────────────────────
-def build_ec2_fetch_request(offset: int) -> bytes:
+def build_ec2_fetch_request(last_id: str = None) -> bytes:
     """
-    Build a paginated XML request filtered to EC2 assets only.
+    Build a filtered XML request for EC2 assets using cursor-based pagination.
 
-    Three bugs in previous versions caused 400 Bad Request errors.
-    All three are fixed here and validated against the official Qualys
-    AssetManagement & Tagging API XSD (release notes v3.13.1):
+    WHY startFromId INSTEAD OF startFromOffset:
+    ─────────────────────────────────────────────
+    Qualys silently caps how many records it returns per page when a
+    filter is active — often far below the limitResults value (e.g. 160
+    records even when limitResults=1000). Using startFromOffset would
+    mean the next request jumps to offset 1001, skipping records 161–1000
+    entirely, then returns empty and stops.
 
-    BUG 1 — Wrong Criteria field name ("cloudProviderType"):
-        "cloudProviderType" is not a valid Criteria field for the
-        search/am/hostasset endpoint. The correct field is "trackingMethod".
-
-    BUG 2 — Wrong enum value ("EC2"):
-        "EC2" does not exist in the AssetTrackingMethod XSD enum.
-        The correct value for AWS EC2 assets is "INSTANCE_ID".
-
-        Full valid enum (from official Qualys XSD):
-          NONE | IP | DNSNAME | NETBIOS | INSTANCE_ID | QAGENT | OCA |
-          ORACLE | SEM | VIRTUAL_MACHINE_ID | PASSIVE_SCANNER |
-          GCP_INSTANCE_ID | SHODAN | PASSIVE_SENSOR | EASM | ICS_OCA
-
-    BUG 3 — Wrong Content-Type header ("application/xml"):
-        Official Qualys API docs specify "text/xml" for this endpoint.
-        Sending "application/xml" causes the request body to be rejected.
-        Fixed in fetch_all_hosts() below.
-
-    Resulting XML that is now sent:
-        <ServiceRequest>
-          <filters>
-            <Criteria field="trackingMethod" operator="EQUALS">INSTANCE_ID</Criteria>
-          </filters>
-          <preferences>
-            <startFromOffset>N</startFromOffset>
-            <limitResults>1000</limitResults>
-          </preferences>
-        </ServiceRequest>
+    startFromId tells Qualys "give me the next page starting after this
+    asset ID". It is not affected by the per-page cap and guarantees
+    every record is fetched exactly once regardless of how many Qualys
+    decides to return per batch.
     """
     root = ET.Element("ServiceRequest")
 
     filters  = ET.SubElement(root, "filters")
     criteria = ET.SubElement(filters, "Criteria")
-    criteria.set("field",    "trackingMethod")  # valid Criteria field  (was: cloudProviderType)
+    criteria.set("field",    "trackingMethod")
     criteria.set("operator", "EQUALS")
-    criteria.text = "INSTANCE_ID"               # valid XSD enum value  (was: EC2)
+    criteria.text = "INSTANCE_ID"
 
     preferences = ET.SubElement(root, "preferences")
-    ET.SubElement(preferences, "startFromOffset").text = str(offset)
+    if last_id:
+        # cursor-based: pick up from the ID after the last one we received
+        ET.SubElement(preferences, "startFromId").text = str(last_id)
+    else:
+        # first page — no cursor yet
+        ET.SubElement(preferences, "startFromOffset").text = "1"
     ET.SubElement(preferences, "limitResults").text = str(PAGE_SIZE)
     return ET.tostring(root, encoding="utf-8")
 
 
 def fetch_all_hosts(session: requests.Session) -> List[ET.Element]:
     """
-    Fetch EC2 HostAsset records from Qualys with pagination.
+    Fetch all EC2 HostAsset records from Qualys using cursor-based pagination.
 
-    The request is now filtered server-side to EC2 assets only, so the
-    number of pages is proportional to your EC2 inventory, not your
-    total Qualys inventory.
+    Uses startFromId (not startFromOffset) so no records are skipped
+    when Qualys returns fewer items per page than limitResults.
     """
-    url = f"{BASE_URL}/qps/rest/2.0/search/am/hostasset"
-    auth = HTTPBasicAuth(USERNAME, PASSWORD)
-    offset = 1
-    page = 1
+    url      = f"{BASE_URL}/qps/rest/2.0/search/am/hostasset"
+    auth     = HTTPBasicAuth(USERNAME, PASSWORD)
+    page     = 1
+    last_id  = None        # cursor: ID of the last host received
     all_hosts = []
 
     while True:
-        log.info(f"Fetching EC2 assets — page {page} (offset {offset})")
+        log.info(f"Fetching EC2 assets — page {page} (cursor id={last_id or 'start'})")
         response = session.post(
             url,
-            headers={"Content-Type": "text/xml", "Accept": "application/xml"},  # text/xml — per official Qualys docs
+            headers={"Content-Type": "text/xml", "Accept": "application/xml"},
             auth=auth,
-            data=build_ec2_fetch_request(offset),
+            data=build_ec2_fetch_request(last_id=last_id),
             verify=CERT_PATH
         )
         response.raise_for_status()
 
-        root = ET.fromstring(response.content)
-        hosts = root.findall(".//HostAsset")
+        root     = ET.fromstring(response.content)
+        hosts    = root.findall(".//HostAsset")
 
         if not hosts:
             break
 
         all_hosts.extend(hosts)
+        log.info(f"  → received {len(hosts)} hosts (total so far: {len(all_hosts)})")
+
         has_more = root.findtext(".//hasMoreRecords", "")
         if str(has_more).lower() != "true":
             break
 
-        offset += PAGE_SIZE
+        # advance cursor to the last received host ID
+        last_id = hosts[-1].findtext("id", "").strip()
+        if not last_id:
+            log.warning("Could not read last host ID — stopping pagination")
+            break
+
         page += 1
 
     log.info(f"Total EC2 hosts fetched: {len(all_hosts)}")
