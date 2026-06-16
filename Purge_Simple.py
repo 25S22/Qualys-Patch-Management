@@ -190,20 +190,46 @@ def build_ec2_fetch_request(offset: int) -> bytes:
     """
     Build a paginated XML request filtered to EC2 assets only.
 
-    Adds a Criteria filter so Qualys skips every host that has no EC2
-    instance ID — meaning only cloud-managed EC2 assets come back.
-    For a mixed inventory of 50,000 hosts where, say, 10,000 are EC2,
-    this cuts the page count from 50 → 10 before a single line of
-    Python matching runs.
+    Three bugs in previous versions caused 400 Bad Request errors.
+    All three are fixed here and validated against the official Qualys
+    AssetManagement & Tagging API XSD (release notes v3.13.1):
+
+    BUG 1 — Wrong Criteria field name ("cloudProviderType"):
+        "cloudProviderType" is not a valid Criteria field for the
+        search/am/hostasset endpoint. The correct field is "trackingMethod".
+
+    BUG 2 — Wrong enum value ("EC2"):
+        "EC2" does not exist in the AssetTrackingMethod XSD enum.
+        The correct value for AWS EC2 assets is "INSTANCE_ID".
+
+        Full valid enum (from official Qualys XSD):
+          NONE | IP | DNSNAME | NETBIOS | INSTANCE_ID | QAGENT | OCA |
+          ORACLE | SEM | VIRTUAL_MACHINE_ID | PASSIVE_SCANNER |
+          GCP_INSTANCE_ID | SHODAN | PASSIVE_SENSOR | EASM | ICS_OCA
+
+    BUG 3 — Wrong Content-Type header ("application/xml"):
+        Official Qualys API docs specify "text/xml" for this endpoint.
+        Sending "application/xml" causes the request body to be rejected.
+        Fixed in fetch_all_hosts() below.
+
+    Resulting XML that is now sent:
+        <ServiceRequest>
+          <filters>
+            <Criteria field="trackingMethod" operator="EQUALS">INSTANCE_ID</Criteria>
+          </filters>
+          <preferences>
+            <startFromOffset>N</startFromOffset>
+            <limitResults>1000</limitResults>
+          </preferences>
+        </ServiceRequest>
     """
     root = ET.Element("ServiceRequest")
 
-    # ── EC2-only filter ──────────────────────────────────────────────
-    filters = ET.SubElement(root, "filters")
+    filters  = ET.SubElement(root, "filters")
     criteria = ET.SubElement(filters, "Criteria")
-    criteria.set("field", "sourceInfo.list.Ec2AssetSourceSimple.instanceId")
-    criteria.set("operator", "IS_NOT_EMPTY")
-    # ────────────────────────────────────────────────────────────────
+    criteria.set("field",    "trackingMethod")  # valid Criteria field  (was: cloudProviderType)
+    criteria.set("operator", "EQUALS")
+    criteria.text = "INSTANCE_ID"               # valid XSD enum value  (was: EC2)
 
     preferences = ET.SubElement(root, "preferences")
     ET.SubElement(preferences, "startFromOffset").text = str(offset)
@@ -229,7 +255,7 @@ def fetch_all_hosts(session: requests.Session) -> List[ET.Element]:
         log.info(f"Fetching EC2 assets — page {page} (offset {offset})")
         response = session.post(
             url,
-            headers={"Content-Type": "application/xml", "Accept": "application/xml"},
+            headers={"Content-Type": "text/xml", "Accept": "application/xml"},  # text/xml — per official Qualys docs
             auth=auth,
             data=build_ec2_fetch_request(offset),
             verify=CERT_PATH
