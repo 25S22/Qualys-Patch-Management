@@ -1,20 +1,17 @@
-"""
-Qualys Asset Purge Script
-Matches stopped/terminated EC2 instances from input files against Qualys assets,
-then optionally purges them.
-"""
-
 import time
 import os
 import sys
+import math
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from collections import defaultdict
-from typing import List, Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Tuple, Optional
 
 import requests
 from requests.auth import HTTPBasicAuth
+from requests.adapters import HTTPAdapter
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -27,6 +24,9 @@ BATCH_SIZE = 50
 USERNAME   = "username"    # Replace with real creds
 PASSWORD   = "password"    # Replace with real creds
 PAGE_SIZE  = 1000
+MAX_WORKERS    = 10         # Parallel threads used to fetch the Qualys inventory
+PAGE_MAX_RETRIES   = 3      # Retries per page before that page is given up on
+PAGE_RETRY_BACKOFF = 1.5    # Seconds, multiplied by attempt number, between retries
 CERT_PATH  = True           # Set to path like "C:\\cert.pem" or True to skip verification
 ASSET_ID_COL  = "Asset ID"
 EC2_RAW_COL   = "sourceInfo.list.Ec2AssetSourceSimple.instanceId"
@@ -36,6 +36,19 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────── AUTH ───────────────────────────
+def build_session() -> requests.Session:
+    """
+    Create a requests.Session with a connection pool large enough for
+    MAX_WORKERS concurrent requests. Reused across threads: it carries no
+    mutable per-request state once requests pass explicit HTTPBasicAuth.
+    """
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 def login(session: requests.Session) -> None:
     """Login to Qualys and store session cookie."""
     response = session.post(
@@ -145,18 +158,15 @@ def purge_assets(session: requests.Session, asset_ids: List[str]) -> List[str]:
 
 
 # ─────────────────────────── INPUT FILE READING ───────────────────────────
-def get_dead_instance_dicts(
+def get_terminated_instance_dicts(
     filepath: str,
     id_column: str = "Resource ID",
     status_column: str = "State"
 ) -> List[Dict]:
     """
-    Read all CSV/Excel files from filepath, return only TERMINATED instances.
-
-    Deliberately excludes 'stopped' instances — stopped instances may be
-    intentionally powered off and restarted later, so purging them from
-    Qualys would cause them to reappear as new untracked assets on next boot.
-    Only 'terminated' instances are permanently gone and safe to purge.
+    Read all CSV/Excel files from filepath, filter rows where status
+    contains 'terminated' (stopped instances are intentionally excluded),
+    and return as list of dicts.
     """
     files_data = {}
     all_data = pd.DataFrame()
@@ -182,104 +192,172 @@ def get_dead_instance_dicts(
         log.warning("No data loaded from input files")
         return []
 
-    # Exact match on "terminated" only — strip whitespace, lowercase both sides
-    # Previously used str.contains("stopped|terminated") which caught stopped too
-    terminated_mask = (
-        all_data[status_column]
-        .astype(str)
-        .str.strip()
-        .str.lower()
-        == "terminated"
-    )
-    dead_df     = all_data[terminated_mask]
-    result_list = dead_df[[id_column, status_column]].to_dict(orient="records")
-    log.info(f"Terminated instances found in files: {len(result_list)}")
+    pattern = r"terminated"
+    terminated_df = all_data[all_data[status_column].astype(str).str.contains(pattern, case=False, na=False)]
+    result_list = terminated_df[[id_column, status_column]].to_dict(orient="records")
+    log.info(f"Total Terminated instances from files: {len(result_list)}")
     return result_list
 
 
 # ─────────────────────────── FETCH ALL HOSTS ───────────────────────────
-def build_ec2_fetch_request(last_id: str = None) -> bytes:
-    """
-    Build a filtered XML request for EC2 assets using cursor-based pagination.
-
-    WHY startFromId INSTEAD OF startFromOffset:
-    ─────────────────────────────────────────────
-    Qualys silently caps how many records it returns per page when a
-    filter is active — often far below the limitResults value (e.g. 160
-    records even when limitResults=1000). Using startFromOffset would
-    mean the next request jumps to offset 1001, skipping records 161–1000
-    entirely, then returns empty and stops.
-
-    startFromId tells Qualys "give me the next page starting after this
-    asset ID". It is not affected by the per-page cap and guarantees
-    every record is fetched exactly once regardless of how many Qualys
-    decides to return per batch.
-    """
+def build_request(offset: int) -> bytes:
+    """Build paginated XML request for fetching hosts."""
     root = ET.Element("ServiceRequest")
-
-    filters  = ET.SubElement(root, "filters")
-    criteria = ET.SubElement(filters, "Criteria")
-    criteria.set("field",    "trackingMethod")
-    criteria.set("operator", "EQUALS")
-    criteria.text = "INSTANCE_ID"
-
     preferences = ET.SubElement(root, "preferences")
-    if last_id:
-        # cursor-based: pick up from the ID after the last one we received
-        ET.SubElement(preferences, "startFromId").text = str(last_id)
-    else:
-        # first page — no cursor yet
-        ET.SubElement(preferences, "startFromOffset").text = "1"
+    ET.SubElement(preferences, "startFromOffset").text = str(offset)
     ET.SubElement(preferences, "limitResults").text = str(PAGE_SIZE)
     return ET.tostring(root, encoding="utf-8")
 
 
-def fetch_all_hosts(session: requests.Session) -> List[ET.Element]:
-    """
-    Fetch all EC2 HostAsset records from Qualys using cursor-based pagination.
+def get_host_count(session: requests.Session) -> int:
+    """Ask Qualys for the total number of HostAsset records (no filters)."""
+    url = f"{BASE_URL}/qps/rest/2.0/count/am/hostasset"
+    auth = HTTPBasicAuth(USERNAME, PASSWORD)
+    response = session.post(
+        url,
+        headers={"Content-Type": "application/xml", "Accept": "application/xml"},
+        auth=auth,
+        data=b"<ServiceRequest/>",
+        verify=CERT_PATH,
+        timeout=60
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
 
-    Uses startFromId (not startFromOffset) so no records are skipped
-    when Qualys returns fewer items per page than limitResults.
+    response_code = root.findtext(".//responseCode", "")
+    if response_code and response_code != "SUCCESS":
+        raise RuntimeError(f"Count request returned responseCode={response_code!r}")
+
+    count_text = root.findtext(".//count", "")
+    if not count_text.isdigit():
+        raise RuntimeError(f"Count request returned an unexpected payload: {count_text!r}")
+    return int(count_text)
+
+
+def fetch_host_page(
+    session: requests.Session,
+    offset: int,
+    page_num: int,
+    total_pages: Optional[int] = None
+) -> List[ET.Element]:
+    """Fetch a single offset-bounded page of HostAsset records, with retries."""
+    url = f"{BASE_URL}/qps/rest/2.0/search/am/hostasset"
+    auth = HTTPBasicAuth(USERNAME, PASSWORD)
+    label = f"{page_num}/{total_pages}" if total_pages else str(page_num)
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, PAGE_MAX_RETRIES + 1):
+        try:
+            response = session.post(
+                url,
+                headers={"Content-Type": "application/xml", "Accept": "application/xml"},
+                auth=auth,
+                data=build_request(offset),
+                verify=CERT_PATH,
+                timeout=60
+            )
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+
+            response_code = root.findtext(".//responseCode", "")
+            if response_code and response_code != "SUCCESS":
+                raise RuntimeError(f"responseCode={response_code!r}")
+
+            hosts = root.findall(".//HostAsset")
+            log.info(f"Page {label} (offset {offset}-{offset + PAGE_SIZE - 1}) -> {len(hosts)} hosts")
+            return hosts
+        except Exception as e:
+            last_error = e
+            log.warning(f"Page {label} (offset {offset}) attempt {attempt}/{PAGE_MAX_RETRIES} failed: {e}")
+            if attempt < PAGE_MAX_RETRIES:
+                time.sleep(PAGE_RETRY_BACKOFF * attempt)
+
+    log.error(f"Page {label} (offset {offset}) failed after {PAGE_MAX_RETRIES} attempts, giving up")
+    raise last_error
+
+
+def fetch_all_hosts(session: requests.Session, max_workers: int = MAX_WORKERS) -> List[ET.Element]:
     """
-    url      = f"{BASE_URL}/qps/rest/2.0/search/am/hostasset"
-    auth     = HTTPBasicAuth(USERNAME, PASSWORD)
-    page     = 1
-    last_id  = None        # cursor: ID of the last host received
+    Fetch all HostAsset records from Qualys in parallel.
+
+    Looks up the total record count first, slices that into PAGE_SIZE-sized
+    offset ranges (1-1000, 1001-2000, ...), then fetches those ranges
+    concurrently across up to `max_workers` threads. Falls back to the
+    slower sequential offset-walk if the count lookup itself fails.
+    """
+    try:
+        total_count = get_host_count(session)
+    except Exception as e:
+        log.warning(f"Count lookup failed ({e}); falling back to sequential pagination")
+        return _fetch_all_hosts_sequential(session)
+
+    if total_count <= 0:
+        log.info("Qualys reports 0 total host assets")
+        return []
+
+    total_pages = math.ceil(total_count / PAGE_SIZE)
+    offsets = [1 + i * PAGE_SIZE for i in range(total_pages)]
+    log.info(f"Qualys reports {total_count} assets -> {total_pages} pages, fetching with {max_workers} workers")
+
+    all_hosts: List[ET.Element] = []
+    failed_pages: List[Tuple[int, int]] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_page = {
+            executor.submit(fetch_host_page, session, offset, idx + 1, total_pages): (idx + 1, offset)
+            for idx, offset in enumerate(offsets)
+        }
+        for future in as_completed(future_to_page):
+            page_num, offset = future_to_page[future]
+            try:
+                all_hosts.extend(future.result())
+            except Exception as e:
+                log.error(f"Giving up on page {page_num} (offset {offset}): {e}")
+                failed_pages.append((page_num, offset))
+
+    if failed_pages:
+        failed_pages.sort()
+        log.warning(f"{len(failed_pages)} page(s) failed permanently: {failed_pages}")
+
+    log.info(f"Total hosts fetched: {len(all_hosts)} (expected {total_count})")
+    return all_hosts
+
+
+def _fetch_all_hosts_sequential(session: requests.Session) -> List[ET.Element]:
+    """Original one-page-at-a-time fallback, used only if the count lookup fails."""
+    url = f"{BASE_URL}/qps/rest/2.0/search/am/hostasset"
+    auth = HTTPBasicAuth(USERNAME, PASSWORD)
+    offset = 1
+    page = 1
     all_hosts = []
 
     while True:
-        log.info(f"Fetching EC2 assets — page {page} (cursor id={last_id or 'start'})")
+        log.info(f"[sequential] Fetching page {page} (offset {offset})")
         response = session.post(
             url,
-            headers={"Content-Type": "text/xml", "Accept": "application/xml"},
+            headers={"Content-Type": "application/xml", "Accept": "application/xml"},
             auth=auth,
-            data=build_ec2_fetch_request(last_id=last_id),
-            verify=CERT_PATH
+            data=build_request(offset),
+            verify=CERT_PATH,
+            timeout=60
         )
         response.raise_for_status()
 
-        root     = ET.fromstring(response.content)
-        hosts    = root.findall(".//HostAsset")
+        root = ET.fromstring(response.content)
+        hosts = root.findall(".//HostAsset")
 
         if not hosts:
             break
 
         all_hosts.extend(hosts)
-        log.info(f"  → received {len(hosts)} hosts (total so far: {len(all_hosts)})")
-
         has_more = root.findtext(".//hasMoreRecords", "")
         if str(has_more).lower() != "true":
             break
 
-        # advance cursor to the last received host ID
-        last_id = hosts[-1].findtext("id", "").strip()
-        if not last_id:
-            log.warning("Could not read last host ID — stopping pagination")
-            break
-
+        offset += PAGE_SIZE
         page += 1
 
-    log.info(f"Total EC2 hosts fetched: {len(all_hosts)}")
+    log.info(f"Total hosts fetched (sequential): {len(all_hosts)}")
     return all_hosts
 
 
@@ -347,8 +425,8 @@ def export_excel(df: pd.DataFrame) -> str:
     return output_file
 
 
-def match_dead_instances(df: pd.DataFrame, found_ids: List[str]) -> pd.DataFrame:
-    """Cross-reference dead EC2 instance IDs against the Qualys assets DataFrame."""
+def match_terminated_instances(df: pd.DataFrame, found_ids: List[str]) -> pd.DataFrame:
+    """Cross-reference terminated EC2 instance IDs against the Qualys assets DataFrame."""
     if EC2_RAW_COL not in df.columns:
         log.warning(f"Column '{EC2_RAW_COL}' not found in dataframe")
         return pd.DataFrame(columns=["Qualys ID", "address", "EC2 Instance ID"])
@@ -361,42 +439,42 @@ def match_dead_instances(df: pd.DataFrame, found_ids: List[str]) -> pd.DataFrame
         "address":        matched["address"] if "address" in matched.columns else "",
         "EC2 Instance ID": matched[EC2_RAW_COL],
     })
-    log.info(f"Matched dead instances in Qualys: {len(result)}")
+    log.info(f"Matched terminated instances in Qualys: {len(result)}")
     return result
 
 
 def export_matched_excel(df: pd.DataFrame) -> str:
-    """Save the matched dead-instance DataFrame to Excel."""
-    output_file = "qualys_dead_matches.xlsx"
-    df.to_excel(output_file, sheet_name="DeadMatches", index=False)
+    """Save the matched terminated-instance DataFrame to Excel."""
+    output_file = "qualys_terminated_matches.xlsx"
+    df.to_excel(output_file, sheet_name="TerminatedMatches", index=False)
     log.info(f"Saved: {output_file}")
     return output_file
 
 
 # ─────────────────────────── MAIN ───────────────────────────
 def main():
-    session = requests.Session()
+    session = build_session()
     try:
-        dead_instances = get_dead_instance_dicts(
+        terminated_instances = get_terminated_instance_dicts(
             FILEPATH,
             id_column="Resource ID",
             status_column="State"
         )
-        found_ids = [item["Resource ID"] for item in dead_instances]
+        found_ids = [item["Resource ID"] for item in terminated_instances]
 
         if not found_ids:
-            log.info("No dead instances found in input files")
+            log.info("No terminated instances found in input files")
             return
 
         login(session)
 
-        hosts = fetch_all_hosts(session)
+        hosts = fetch_all_hosts(session, max_workers=MAX_WORKERS)
         if not hosts:
             log.info("No assets found in Qualys")
             return
 
         df = build_dataframe(hosts)
-        matched_df = match_dead_instances(df, found_ids)
+        matched_df = match_terminated_instances(df, found_ids)
 
         if matched_df.empty:
             log.info("No matching assets found in Qualys")
