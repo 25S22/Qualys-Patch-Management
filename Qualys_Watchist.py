@@ -5,40 +5,57 @@ Pulls the most widespread critical CVEs from Qualys VMDR, ranks them by the
 number of assets they affect, and writes an Excel file that can be used as
 context for building a Vulnerability Watchlist in Recorded Future.
 
+APIs USED  (VMDR only — nothing else is called)
+───────────────────────────────────────────────
+  1. POST /api/2.0/fo/session/                  login / logout
+  2. GET  /api/2.0/fo/asset/host/vm/detection/  Host List VM Detection
+  3. POST /api/2.0/fo/knowledge_base/vuln/      VM Knowledge Base
+
+  No other Qualys module or API is called. Asset counts come purely from
+  VMDR host detections.
+
 HOW IT WORKS
 ────────────
  Step 1 — FETCH DETECTIONS
-   Calls the Host List VM Detection API
-   (GET /api/2.0/fo/asset/host/vm/detection/) filtered to the severities and
-   statuses you configure (default: severity 4-5, Confirmed, New/Active/
-   Re-Opened) and follows the pagination links until every host is read.
-   Builds a map of  QID → {set of host IDs}.
+   Reads host detections filtered by severity and status (default: severity
+   4-5, New/Active/Re-Opened) and follows the pagination links until every
+   host has been read.  Builds a map of  QID → {set of host IDs}.
+   Potential detections are dropped client-side unless INCLUDE_POTENTIAL=True.
 
  Step 2 — ENRICH
-   Calls the Knowledge Base API
-   (POST /api/2.0/fo/knowledge_base/vuln/) for every QID found and reads the
-   CVE list, title, CVSS, threat-intelligence tags and publish date.
+   Looks up every QID in the Knowledge Base for its CVE list, title, CVSS,
+   threat-intelligence tags and publish date.
 
  Step 3 — RANK & FILTER
-   A QID can map to several CVEs and a CVE can map to several QIDs, so asset
-   counts are calculated per CVE as the UNIQUE set of hosts across all of its
-   QIDs (a host is never counted twice for the same CVE).
+   A QID can map to several CVEs and a CVE to several QIDs, so asset counts
+   are calculated per CVE as the UNIQUE set of hosts across all of its QIDs.
      • Drops CVEs whose asset count is NOT greater than MIN_ASSET_COUNT
-     • Sorts by asset count (desc) → max QDS → CVSS v3
+     • Sorts by asset count (desc) → CVSS v3 → Qualys severity
      • Keeps the first TOP_N rows
 
  Step 4 — EXPORT
-   Saves an Excel workbook with two sheets:
+   Saves an Excel workbook:
      "CVE Watchlist"  – the ranked CVEs
      "Run Info"       – the parameters and totals used for this run
 
    This script is READ-ONLY — it never changes anything in Qualys.
 
+TROUBLESHOOTING
+───────────────
+  • Errors print Qualys's own message (HTTP status, code and text).
+  • If your platform rejects an optional parameter ("Unrecognized
+    parameter(s): …") the script drops it automatically and retries.
+  • If nothing is found, the script runs an unfiltered test call and tells you
+    whether the problem is your filters or your account's asset scope.
+  • If CVEs exist but none beat MIN_ASSET_COUNT, the highest counts are shown
+    so you can pick a sensible threshold.
+  • Set DEBUG_SAVE_XML = True to keep the raw first-page XML for inspection.
+
 PERMISSIONS REQUIRED
 ────────────────────
   • API Access
-  • VM / VMDR module with access to the assets you want counted
-    (counts only reflect hosts your account's asset groups / tags can see)
+  • VMDR access to the assets you want counted (counts only reflect hosts your
+    account's asset groups / tags can see)
 
 DEPENDENCIES
 ────────────
@@ -46,6 +63,7 @@ DEPENDENCIES
 """
 
 import os
+import re
 import sys
 import time
 import logging
@@ -70,7 +88,8 @@ PASSWORD     = os.getenv("QUALYS_PASSWORD", "your_qualys_password")
 # Find it: Qualys UI → Help → About → Security Operations Center
 BASE_URL     = "https://qualysapi.qg1.apps.qualys.in"
 
-# SSL certificate bundle.  Set to False only in a trusted test environment.
+# SSL certificate bundle.  Use a .pem path, True (system CAs), or False for a
+# trusted test environment only.
 CERT_PATH    = "/path/to/your/corporate_cert.pem"
 
 # ── What to report ───────────────────────────────────────────────────────────
@@ -82,16 +101,12 @@ MIN_ASSET_COUNT  = 100     # only keep CVEs affecting MORE THAN this many hosts
 # Accepts a single level, a comma list, or a range:  "5"  |  "4,5"  |  "4-5"
 SEVERITY_LEVELS  = "4-5"
 
-# "confirmed" = only confirmed detections (recommended, fewer false positives)
-# "potential" = only potential detections   |   "" = both
-VULN_TYPE        = "confirmed"
-
 # Detection status to count.  Fixed detections are excluded by default.
 DETECTION_STATUS = "New,Active,Re-Opened"
 
-# Pull Qualys Detection Score (QDS) too.  Harmless if your subscription
-# doesn't have it — the column will just be empty.
-SHOW_QDS         = True
+# False = count only CONFIRMED detections (recommended, fewer false positives)
+# True  = also count POTENTIAL detections
+INCLUDE_POTENTIAL = False
 
 # Optional extra filters passed straight to the detection API, e.g.
 #   {"ips": "10.0.0.0/16"}
@@ -105,6 +120,9 @@ KB_BATCH_SIZE    = 100     # QIDs per Knowledge Base request
 TIMEOUT          = 600     # seconds to wait for a single API response
 MAX_RETRIES      = 5       # attempts per request on 409 / 429 / 5xx
 RETRY_WAIT       = 15      # seconds to wait if Qualys doesn't send Retry-After
+
+# True = save raw first-page XML files (qualys_debug_*.xml) for inspection
+DEBUG_SAVE_XML   = False
 
 # ── Output ───────────────────────────────────────────────────────────────────
 # A timestamp is inserted before the extension, e.g. qualys_cve_watchlist_20250101_120000.xlsx
@@ -125,6 +143,15 @@ DLINE = "═" * 65
 
 
 # ── Small helpers ─────────────────────────────────────────────────────────────
+class QualysAPIError(RuntimeError):
+    """Raised for any Qualys error, carrying the real message."""
+
+    def __init__(self, status, code, text):
+        self.status, self.code, self.text = status, code, text
+        super().__init__(f"Qualys API error — HTTP {status}"
+                         f"{' | code ' + code if code else ''}: {text}")
+
+
 def _to_float(val):
     try:
         return float(val)
@@ -141,6 +168,14 @@ def _max_none(a, b):
     return max(a, b)
 
 
+def _debug_save(name: str, content: bytes):
+    if DEBUG_SAVE_XML:
+        path = f"qualys_debug_{name}.xml"
+        with open(path, "wb") as fh:
+            fh.write(content)
+        log.info(f"  [debug] raw response saved → {path}")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 class QualysCVEWatchlist:
 
@@ -148,17 +183,33 @@ class QualysCVEWatchlist:
         self.base_url   = BASE_URL.rstrip("/")
         self.session    = requests.Session()
         self.fo_headers = {"X-Requested-With": "QualysCVEWatchlist"}
+        self.det_url    = f"{self.base_url}/api/2.0/fo/asset/host/vm/detection/"
+
+    # ── Config sanity check ──────────────────────────────────────────────────
+    @staticmethod
+    def _check_config():
+        problems = []
+        if USERNAME.startswith("your_") or PASSWORD.startswith("your_"):
+            problems.append(
+                "USERNAME / PASSWORD still hold placeholder values "
+                "(edit them, or set QUALYS_USERNAME / QUALYS_PASSWORD)."
+            )
+        if isinstance(CERT_PATH, str) and not os.path.isfile(CERT_PATH):
+            problems.append(
+                f"CERT_PATH file not found: {CERT_PATH}  "
+                "(use a real .pem path, True, or False for testing)."
+            )
+        if not BASE_URL.startswith("https://"):
+            problems.append("BASE_URL must start with https://")
+        if problems:
+            raise ValueError("Configuration problem(s):\n    - " + "\n    - ".join(problems))
 
     # ── Session ──────────────────────────────────────────────────────────────
     def login(self):
-        r = self.session.post(
-            f"{self.base_url}/api/2.0/fo/session/",
-            headers=self.fo_headers,
+        self._request(
+            "POST", f"{self.base_url}/api/2.0/fo/session/",
             data={"action": "login", "username": USERNAME, "password": PASSWORD},
-            verify=CERT_PATH,
-            timeout=60,
         )
-        r.raise_for_status()
         if "QualysSession" not in self.session.cookies:
             raise RuntimeError(
                 "Login failed — no session cookie returned.\n"
@@ -180,6 +231,26 @@ class QualysCVEWatchlist:
         log.info("  ✔  Logged out")
 
     # ── HTTP helpers ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _api_error(r: requests.Response) -> QualysAPIError:
+        """Build an error that includes whatever Qualys said."""
+        code = text = ""
+        try:
+            root = ET.fromstring(r.content)
+            code = root.findtext(".//CODE", default="").strip()
+            text = root.findtext(".//TEXT", default="").strip()
+        except ET.ParseError:
+            pass
+        if not text:
+            text = (r.text or "").strip()[:500] or "(empty response body)"
+        if r.status_code == 401:
+            text += "  → check credentials; the account needs API Access."
+        elif r.status_code == 403:
+            text += "  → permission denied; check API Access, role and asset-group scope."
+        elif r.status_code in (409, 429):
+            text += "  → concurrency / rate limit; wait a few minutes and re-run."
+        return QualysAPIError(r.status_code, code, text)
+
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
         """
         Send a request with automatic retry on 409 / 429 / 5xx.
@@ -195,7 +266,8 @@ class QualysCVEWatchlist:
                 timeout=TIMEOUT,
                 **kwargs,
             )
-            if r.status_code in (409, 429) or r.status_code >= 500:
+            retryable = r.status_code in (409, 429) or r.status_code >= 500
+            if retryable and attempt < MAX_RETRIES:
                 try:
                     wait = int(r.headers.get("Retry-After", RETRY_WAIT))
                 except ValueError:
@@ -206,32 +278,38 @@ class QualysCVEWatchlist:
                 )
                 time.sleep(wait)
                 continue
-            if r.status_code == 401:
-                raise RuntimeError(
-                    "HTTP 401 — check that your account has API Access and "
-                    "access to the VM module."
-                )
-            r.raise_for_status()
+            if r.status_code >= 400:
+                raise self._api_error(r)
             return r
-        raise RuntimeError(f"Request failed after {MAX_RETRIES} attempts: {url}")
+        raise RuntimeError("unreachable")   # pragma: no cover
 
     @staticmethod
     def _parse(r: requests.Response) -> ET.Element:
         """Parse XML and raise if Qualys returned a SIMPLE_RETURN error."""
-        root = ET.fromstring(r.content)
+        try:
+            root = ET.fromstring(r.content)
+        except ET.ParseError:
+            snippet = (r.text or "")[:300].replace("\n", " ")
+            raise RuntimeError(f"Qualys returned a non-XML response: {snippet}")
         if root.tag == "SIMPLE_RETURN":
             code = root.findtext(".//CODE", default="").strip()
             text = root.findtext(".//TEXT", default="").strip()
-            raise RuntimeError(f"Qualys API error {code}: {text}")
+            raise QualysAPIError(r.status_code, code, text)
         return root
 
+    @staticmethod
+    def _unrecognized_params(text: str) -> list:
+        """Pull parameter names out of 'Unrecognized parameter(s): a, b (…)'."""
+        m = re.search(r"Unrecognized parameter\(s\):\s*([^()]+)", text or "", re.I)
+        return [p.strip() for p in m.group(1).split(",") if p.strip()] if m else []
+
     # ── Step 1: detections → QID → hosts ─────────────────────────────────────
-    def fetch_detections(self) -> tuple[dict, dict, int]:
+    def fetch_detections(self) -> tuple[dict, int, int]:
         """
         Returns:
-          qid_hosts : { "qid": {host_id, host_id, …} }
-          qid_qds   : { "qid": highest QDS seen for that QID }
-          host_count: number of distinct hosts with at least one matching detection
+          qid_hosts        : { "qid": {host_id, host_id, …} }
+          hosts_returned   : number of hosts Qualys sent back (before client filters)
+          skipped_potential: detections dropped because INCLUDE_POTENTIAL is False
         """
         params = {
             "action":           "list",
@@ -241,22 +319,34 @@ class QualysCVEWatchlist:
             "truncation_limit": HOSTS_PER_PAGE,
             "output_format":    "XML",
         }
-        if VULN_TYPE:
-            params["include_vuln_type"] = VULN_TYPE
-        if SHOW_QDS:
-            params["show_qds"] = 1
         params.update(EXTRA_DETECTION_PARAMS)
 
-        url        = f"{self.base_url}/api/2.0/fo/asset/host/vm/detection/"
-        qid_hosts  = defaultdict(set)
-        qid_qds    = {}
-        hosts_seen = set()
-        page       = 0
+        url               = self.det_url
+        qid_hosts         = defaultdict(set)
+        hosts_seen        = set()
+        skipped_potential = 0
+        page              = 0
 
         while url:
             page += 1
-            r    = self._request("GET", url, params=params if page == 1 else None)
-            root = self._parse(r)
+            try:
+                r    = self._request("GET", url, params=params if page == 1 else None)
+                root = self._parse(r)
+            except QualysAPIError as e:
+                # Platform rejected an optional parameter → drop it and retry
+                bad = [p for p in self._unrecognized_params(e.text)
+                       if p in params and p != "action"]
+                if page == 1 and bad:
+                    for p in bad:
+                        params.pop(p)
+                    log.info(f"  ⚠  Platform rejected parameter(s) {bad} — "
+                             f"dropped, retrying…")
+                    page = 0
+                    continue
+                raise
+
+            if page == 1:
+                _debug_save("detection_page1", r.content)
 
             page_hosts = 0
             for host in root.iter("HOST"):
@@ -269,10 +359,13 @@ class QualysCVEWatchlist:
                     qid = det.findtext("QID", default="").strip()
                     if not qid:
                         continue
+                    dtype = det.findtext("TYPE", default="").strip().lower()
+                    if dtype == "info":
+                        continue
+                    if dtype == "potential" and not INCLUDE_POTENTIAL:
+                        skipped_potential += 1
+                        continue
                     qid_hosts[qid].add(hid)
-                    qds = _to_float(det.findtext("QDS"))
-                    if qds is not None:
-                        qid_qds[qid] = max(qid_qds.get(qid, 0), qds)
 
             log.info(
                 f"  Page {page:<4} {page_hosts:>5} host(s)   "
@@ -285,7 +378,34 @@ class QualysCVEWatchlist:
             url      = next_url.strip() if next_url else None
             time.sleep(0.3)   # polite gap
 
-        return dict(qid_hosts), qid_qds, len(hosts_seen)
+        return dict(qid_hosts), len(hosts_seen), skipped_potential
+
+    def diagnose_empty(self):
+        """Unfiltered test call — tells the user WHY nothing came back."""
+        log.info("\n  Running a diagnostic call with NO severity/status filters…")
+        try:
+            r     = self._request("GET", self.det_url, params={
+                "action": "list", "truncation_limit": 5, "show_results": 0,
+            })
+            root  = self._parse(r)
+            hosts = root.findall(".//HOST")
+            dets  = sum(len(h.findall("./DETECTION_LIST/DETECTION")) for h in hosts)
+        except Exception as exc:                       # diagnostic must never crash
+            log.info(f"  ✘  Diagnostic call failed: {exc}")
+            return
+        if not hosts:
+            log.info(
+                "  ✘  Even without filters the API returned NO hosts.\n"
+                "     → Your account sees no scanned hosts. Check the user's role /\n"
+                "       asset-group scope, and that scanners or agents have completed\n"
+                "       VM scans (GAV inventory alone does not create detections)."
+            )
+        else:
+            log.info(
+                f"  ✔  Unfiltered call returned {len(hosts)} host(s) / {dets} detection(s).\n"
+                "     → The API works; your filters are too strict. Review\n"
+                "       SEVERITY_LEVELS, DETECTION_STATUS and EXTRA_DETECTION_PARAMS."
+            )
 
     # ── Step 2: Knowledge Base enrichment ────────────────────────────────────
     def fetch_kb(self, qids: list) -> dict:
@@ -307,6 +427,8 @@ class QualysCVEWatchlist:
                 "POST", url,
                 data={"action": "list", "ids": ",".join(batch), "details": "All"},
             )
+            if start == 0:
+                _debug_save("knowledge_base_batch1", r.content)
             root = self._parse(r)
 
             for v in root.findall(".//VULN_LIST/VULN"):
@@ -337,7 +459,7 @@ class QualysCVEWatchlist:
 
     # ── Step 3: aggregate by CVE, filter, rank ───────────────────────────────
     @staticmethod
-    def build_cve_table(qid_hosts: dict, qid_qds: dict, kb: dict) -> tuple[dict, int]:
+    def build_cve_table(qid_hosts: dict, kb: dict) -> tuple[dict, int]:
         """
         Collapse QID-level data into CVE-level data.
         Asset count = UNION of hosts across every QID that references the CVE.
@@ -355,7 +477,7 @@ class QualysCVEWatchlist:
                 e = cves.setdefault(cve, {
                     "hosts": set(), "qids": set(),
                     "title": "", "title_hosts": -1,
-                    "severity": 0, "cvss2": None, "cvss3": None, "qds": None,
+                    "severity": 0, "cvss2": None, "cvss3": None,
                     "intel": set(), "published": "", "patchable": False,
                 })
                 e["hosts"] |= hosts
@@ -368,7 +490,6 @@ class QualysCVEWatchlist:
                 e["severity"]  = max(e["severity"], meta["severity"])
                 e["cvss2"]     = _max_none(e["cvss2"], meta["cvss2"])
                 e["cvss3"]     = _max_none(e["cvss3"], meta["cvss3"])
-                e["qds"]       = _max_none(e["qds"], qid_qds.get(qid))
                 e["intel"].update(meta["intel"])
                 e["patchable"] = e["patchable"] or meta["patchable"]
                 if meta["published"] and (not e["published"] or meta["published"] < e["published"]):
@@ -389,27 +510,26 @@ class QualysCVEWatchlist:
                 continue
             intel_lc = [t.lower() for t in e["intel"]]
             rows.append({
-                "CVE ID":               cve,
-                "Affected Assets":      count,
-                "QID Count":            len(e["qids"]),
-                "QIDs":                 ", ".join(sorted(e["qids"], key=int)),
-                "Title":                e["title"],
-                "Qualys Severity":      e["severity"],
-                "CVSS v3":              e["cvss3"],
-                "CVSS v2":              e["cvss2"],
-                "Max QDS":              e["qds"],
-                "CISA KEV":             "Yes" if any("cisa" in t for t in intel_lc) else "No",
-                "Active Attacks":       "Yes" if any("active_attacks" in t for t in intel_lc) else "No",
-                "Threat Intel Tags":    ", ".join(sorted(e["intel"])),
-                "Patchable":            "Yes" if e["patchable"] else "No",
-                "Published (Qualys)":   e["published"],
+                "CVE ID":             cve,
+                "Affected Assets":    count,
+                "QID Count":          len(e["qids"]),
+                "QIDs":               ", ".join(sorted(e["qids"], key=int)),
+                "Title":              e["title"],
+                "Qualys Severity":    e["severity"],
+                "CVSS v3":            e["cvss3"],
+                "CVSS v2":            e["cvss2"],
+                "CISA KEV":           "Yes" if any("cisa" in t for t in intel_lc) else "No",
+                "Active Attacks":     "Yes" if any("active_attacks" in t for t in intel_lc) else "No",
+                "Threat Intel Tags":  ", ".join(sorted(e["intel"])),
+                "Patchable":          "Yes" if e["patchable"] else "No",
+                "Published (Qualys)": e["published"],
             })
 
         above_threshold = len(rows)
         rows.sort(key=lambda x: (
             -x["Affected Assets"],
-            -(x["Max QDS"] or 0),
             -(x["CVSS v3"] or 0),
+            -x["Qualys Severity"],
             x["CVE ID"],
         ))
         rows = rows[:TOP_N]
@@ -436,11 +556,13 @@ class QualysCVEWatchlist:
 
     # ── Main flow ─────────────────────────────────────────────────────────────
     def run(self):
+        self._check_config()
+
         log.info(DLINE)
-        log.info("  Qualys Critical CVE Watchlist Builder")
+        log.info("  Qualys Critical CVE Watchlist Builder  (VMDR)")
         log.info(DLINE)
         log.info(f"  Severity levels     : {SEVERITY_LEVELS}")
-        log.info(f"  Detection type      : {VULN_TYPE or 'confirmed + potential'}")
+        log.info(f"  Detection type      : {'confirmed + potential' if INCLUDE_POTENTIAL else 'confirmed only'}")
         log.info(f"  Detection status    : {DETECTION_STATUS}")
         log.info(f"  Top N               : {TOP_N}")
         log.info(f"  Min asset count     : > {MIN_ASSET_COUNT}")
@@ -451,24 +573,41 @@ class QualysCVEWatchlist:
         try:
             # ── STEP 1 — FETCH DETECTIONS ─────────────────────────────────────
             log.info("\n  STEP 1 — Fetching detections (this can take a while)…\n")
-            qid_hosts, qid_qds, host_count = self.fetch_detections()
+            qid_hosts, hosts_returned, skipped_potential = self.fetch_detections()
 
             if not qid_hosts:
-                log.info("\n  No matching detections returned. Check the filters. Exiting.")
+                log.info("\n  ✘  No usable detections found.")
+                if hosts_returned == 0:
+                    self.diagnose_empty()
+                else:
+                    log.info(
+                        f"     {hosts_returned:,} host(s) were returned, but every detection was\n"
+                        f"     a Potential one ({skipped_potential:,} skipped). "
+                        f"Set INCLUDE_POTENTIAL = True to count them."
+                    )
                 return
 
+            host_count = len(set().union(*qid_hosts.values()))
             log.info(
                 f"\n  ✔  {host_count:,} host(s) with {len(qid_hosts):,} "
                 f"unique QID(s) matched your filters"
+                + (f"  ({skipped_potential:,} potential detection(s) skipped)"
+                   if skipped_potential else "")
             )
 
             # ── STEP 2 — ENRICH ───────────────────────────────────────────────
             log.info("\n  STEP 2 — Enriching QIDs from the Knowledge Base…\n")
             kb = self.fetch_kb(list(qid_hosts.keys()))
             log.info(f"\n  ✔  {len(kb):,} / {len(qid_hosts):,} QID(s) resolved")
+            if not kb:
+                raise RuntimeError(
+                    "The Knowledge Base returned no data for any QID. "
+                    "Check the account has access to the Knowledge Base API "
+                    "(re-run with DEBUG_SAVE_XML = True to inspect the response)."
+                )
 
             # ── STEP 3 — RANK & FILTER ────────────────────────────────────────
-            cves, no_cve_qids = self.build_cve_table(qid_hosts, qid_qds, kb)
+            cves, no_cve_qids = self.build_cve_table(qid_hosts, kb)
             df, above         = self.rank(cves)
 
             log.info("")
@@ -481,11 +620,23 @@ class QualysCVEWatchlist:
             log.info(f"  CVEs exported (Top {TOP_N})         : {len(df):,}")
 
             if df.empty:
-                top_seen = max((len(e["hosts"]) for e in cves.values()), default=0)
+                if not cves:
+                    log.info(
+                        "\n  ✘  None of the detected QIDs map to a CVE. "
+                        "Nothing to export."
+                    )
+                    return
+                ranked = sorted(cves.items(), key=lambda kv: -len(kv[1]["hosts"]))
                 log.info(
-                    f"\n  No CVE exceeded {MIN_ASSET_COUNT} affected host(s). "
-                    f"Highest count seen: {top_seen}.\n"
-                    f"  Lower MIN_ASSET_COUNT and re-run. No file written."
+                    f"\n  ✘  No CVE affects more than {MIN_ASSET_COUNT} host(s). "
+                    f"Highest counts seen:\n"
+                )
+                log.info(f"  {'CVE ID':<16} {'Assets':>7}  Title")
+                log.info(f"  {'─'*16} {'─'*7}  {'─'*40}")
+                for cve, e in ranked[:10]:
+                    log.info(f"  {cve:<16} {len(e['hosts']):>7}  {e['title'][:50]}")
+                log.info(
+                    "\n  Lower MIN_ASSET_COUNT (or set it to 0) and re-run. No file written."
                 )
                 return
 
@@ -503,20 +654,21 @@ class QualysCVEWatchlist:
 
             # ── STEP 4 — EXPORT ───────────────────────────────────────────────
             info = [
-                ("Generated (UTC)",                  datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
-                ("Qualys platform",                  self.base_url),
-                ("Severity levels",                  SEVERITY_LEVELS),
-                ("Detection type",                   VULN_TYPE or "confirmed + potential"),
-                ("Detection status",                 DETECTION_STATUS),
-                ("Extra detection filters",          str(EXTRA_DETECTION_PARAMS) if EXTRA_DETECTION_PARAMS else "none"),
-                ("TOP_N",                            TOP_N),
+                ("Generated (UTC)",                      datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
+                ("Qualys platform",                      self.base_url),
+                ("Severity levels",                      SEVERITY_LEVELS),
+                ("Detection type",                       "confirmed + potential" if INCLUDE_POTENTIAL else "confirmed only"),
+                ("Detection status",                     DETECTION_STATUS),
+                ("Extra detection filters",              str(EXTRA_DETECTION_PARAMS) if EXTRA_DETECTION_PARAMS else "none"),
+                ("TOP_N",                                TOP_N),
                 ("MIN_ASSET_COUNT (strictly more than)", MIN_ASSET_COUNT),
-                ("Hosts with matching detections",   host_count),
-                ("Unique QIDs matched",              len(qid_hosts)),
-                ("QIDs without a CVE (skipped)",     no_cve_qids),
-                ("Unique CVEs found",                len(cves)),
-                ("CVEs above asset threshold",       above),
-                ("CVEs exported",                    len(df)),
+                ("Hosts with matching detections",       host_count),
+                ("Unique QIDs matched",                  len(qid_hosts)),
+                ("Potential detections skipped",         skipped_potential),
+                ("QIDs without a CVE (skipped)",         no_cve_qids),
+                ("Unique CVEs found",                    len(cves)),
+                ("CVEs above asset threshold",           above),
+                ("CVEs exported",                        len(df)),
             ]
             output_file = self.export(df, info)
 
@@ -576,4 +728,14 @@ def _apply_styles(filepath: str):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    QualysCVEWatchlist().run()
+    try:
+        QualysCVEWatchlist().run()
+    except requests.exceptions.SSLError as exc:
+        log.info(f"\n  ✘  SSL error: {exc}\n     Check CERT_PATH (or your corporate proxy certificate).\n")
+        sys.exit(1)
+    except requests.exceptions.RequestException as exc:
+        log.info(f"\n  ✘  Network error: {exc}\n     Check BASE_URL and connectivity.\n")
+        sys.exit(1)
+    except (ValueError, RuntimeError) as exc:      # includes QualysAPIError
+        log.info(f"\n  ✘  {exc}\n")
+        sys.exit(1)
