@@ -18,7 +18,6 @@ from __future__ import annotations
 import atexit
 import getpass
 import html
-import json
 import os
 import re
 import tempfile
@@ -30,12 +29,22 @@ import pandas as pd
 import requests
 import urllib3
 
-# --------------------------------------------------------------------------
-# CONFIGURATION
-# --------------------------------------------------------------------------
-SETTINGS_FILE = Path.home() / ".qualys_vdi_export.json"  # remembers everything EXCEPT the password
-DEFAULT_URL = "https://qualysapi.qualys.com"
-DEFAULT_OUTPUT = "Qualys_Server_VDI_Vulnerabilities.xlsx"
+# ─────────────────────────── CONFIG ───────────────────────────
+BASE_URL   = "https://qualysapi.xx.apps.qualys.in"  # Replace with your actual Qualys API URL
+USERNAME   = ""     # Qualys API username. Leave blank to be prompted at run time.
+PASSWORD   = ""     # Qualys API password. Leave blank to be prompted (typing is hidden).
+CERT_PATH  = ""     # SSL verification:
+                    #   ""  or True -> verify using the default trusted CAs
+                    #   "C:\\certs\\corp-root.pem" -> also trust this Base-64 (PEM) cert/bundle
+                    #   False -> do NOT verify (insecure, testing only)
+APPEND_TO_DEFAULT_CAS = True  # True: CERT_PATH is added to the default CAs. False: trust ONLY that file.
+SERVERS    = ""     # e.g. "srv01, srv02.corp.local, 10.1.2.3"  (blank = prompt)
+OUTPUT_FILE = "Qualys_Server_VDI_Vulnerabilities.xlsx"
+INCLUDE_IG = False  # True = also include Information Gathered detections
+USE_CONFIG_DIALOG = False  # True = show a pop-up form (pre-filled from the values above)
+
+DEFAULT_URL = BASE_URL
+DEFAULT_OUTPUT = OUTPUT_FILE
 
 # API server per Qualys platform (check your pod under Help > About in the Qualys UI)
 POD_URLS = [
@@ -388,24 +397,6 @@ def run_export(cfg: dict, log=print) -> str:
 
 
 # --------------------------------------------------------------------------
-# Settings (password is never saved)
-# --------------------------------------------------------------------------
-def load_settings() -> dict:
-    try:
-        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
-def save_settings(cfg: dict) -> None:
-    keep = ["base_url", "username", "verify_ssl", "ca_path", "append_ca", "output_file", "include_ig"]
-    try:
-        SETTINGS_FILE.write_text(json.dumps({k: cfg.get(k) for k in keep}, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-
-
-# --------------------------------------------------------------------------
 # Config box (Tkinter) + console fallback
 # --------------------------------------------------------------------------
 def get_config_gui(defaults: dict):
@@ -422,7 +413,7 @@ def get_config_gui(defaults: dict):
 
     v_url = tk.StringVar(value=defaults.get("base_url") or DEFAULT_URL)
     v_user = tk.StringVar(value=defaults.get("username") or "")
-    v_pass = tk.StringVar()
+    v_pass = tk.StringVar(value=defaults.get("password") or "")
     v_verify = tk.BooleanVar(value=defaults.get("verify_ssl", True))
     v_ca = tk.StringVar(value=defaults.get("ca_path") or "")
     v_append = tk.BooleanVar(value=defaults.get("append_ca", True))
@@ -575,40 +566,59 @@ def get_config_gui(defaults: dict):
     return result or None
 
 
-def get_config_cli(defaults: dict):
-    print("(GUI not available - using console prompts)")
-    d_url = defaults.get("base_url") or DEFAULT_URL
-    base_url = input(f"Qualys API URL [{d_url}]: ").strip() or d_url
-    d_user = defaults.get("username") or ""
-    username = input(f"Qualys API Username [{d_user}]: ").strip() or d_user
-    password = getpass.getpass("Qualys API Password: ")
-    ca = input("CA cert/bundle path (blank = default CAs, 'none' = skip SSL verification): ").strip().strip('"')
-    servers = parse_server_list(input("Server names (comma-separated): "))
-    if not (username and password and servers):
-        return None
+_PLACEHOLDERS = {"", "username", "password"}
+
+
+def build_cfg_from_config() -> dict:
+    ca = CERT_PATH if isinstance(CERT_PATH, str) else ""
     return {
-        "base_url": base_url.rstrip("/"), "username": username, "password": password,
-        "verify_ssl": ca.lower() != "none", "ca_path": "" if ca.lower() == "none" else ca,
-        "append_ca": True, "output_file": defaults.get("output_file") or DEFAULT_OUTPUT,
-        "include_ig": False, "servers": servers,
+        "base_url": (BASE_URL or "").strip().rstrip("/"),
+        "username": "" if (USERNAME or "").strip().lower() in _PLACEHOLDERS else USERNAME.strip(),
+        "password": "" if (PASSWORD or "").strip().lower() in _PLACEHOLDERS else PASSWORD,
+        "verify_ssl": CERT_PATH is not False,
+        "ca_path": ca.strip().strip('"'),
+        "append_ca": APPEND_TO_DEFAULT_CAS,
+        "output_file": OUTPUT_FILE or DEFAULT_OUTPUT,
+        "include_ig": INCLUDE_IG,
+        "servers": parse_server_list(SERVERS),
     }
 
 
+def prompt_missing(cfg: dict) -> dict:
+    """Asks in the console for anything still blank in the CONFIG block."""
+    if not cfg["base_url"] or ".xx." in cfg["base_url"]:
+        cfg["base_url"] = input("Qualys API URL (e.g. https://qualysapi.qg1.apps.qualys.in): ").strip().rstrip("/")
+    if not cfg["username"]:
+        cfg["username"] = input("Qualys API Username: ").strip()
+    if not cfg["password"]:
+        cfg["password"] = getpass.getpass("Qualys API Password: ")
+    if cfg["verify_ssl"] and not cfg["ca_path"] and not CERT_PATH:
+        ca = input("SSL cert path (.pem/.crt) - press Enter to use default CAs: ").strip().strip('"')
+        cfg["ca_path"] = ca
+    if not cfg["servers"]:
+        cfg["servers"] = parse_server_list(input("Server names (comma-separated): "))
+    return cfg
+
+
 def main() -> int:
-    defaults = load_settings()
-    try:
-        cfg = get_config_gui(defaults)
-    except GuiUnavailable:
-        cfg = get_config_cli(defaults)
-    if not cfg:
+    cfg = build_cfg_from_config()
+    if USE_CONFIG_DIALOG:
+        try:
+            cfg = get_config_gui(cfg)  # pre-filled from the CONFIG block
+        except GuiUnavailable:
+            print("(Config dialog unavailable here - using console prompts)")
+            cfg = prompt_missing(cfg)
+    else:
+        cfg = prompt_missing(cfg)
+
+    if not cfg or not all(cfg.get(k) for k in ("base_url", "username", "password", "servers")):
         print("Cancelled / incomplete input. Exiting.")
         return 1
 
-    save_settings(cfg)
     try:
         run_export(cfg)
     except requests.exceptions.SSLError as exc:
-        print(f"\nSSL error: {exc}\nUse a CA certificate path (corporate root CA) or fix the proxy trust.")
+        print(f"\nSSL error: {exc}\nSet CERT_PATH to your corporate root CA (Base-64 .pem/.crt).")
         return 2
     except (QualysError, requests.exceptions.RequestException) as exc:
         print(f"\nERROR: {exc}")
