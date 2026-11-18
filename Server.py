@@ -16,6 +16,7 @@ Needs: pip install requests pandas openpyxl   (tkinter ships with most Python in
 from __future__ import annotations
 
 import atexit
+import difflib
 import getpass
 import html
 import os
@@ -28,6 +29,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 import urllib3
+from requests.auth import HTTPBasicAuth
 
 # ─────────────────────────── CONFIG ───────────────────────────
 BASE_URL   = "https://qualysapi.xx.apps.qualys.in"  # Replace with your actual Qualys API URL
@@ -158,19 +160,37 @@ def _error_text(resp: requests.Response) -> str:
 class QualysClient:
     def __init__(self, cfg: dict):
         self.base_url = cfg["base_url"].rstrip("/")
+        self.username = cfg["username"]
+        self._password = cfg["password"]
+        # Credentials are passed per request (like a normal Basic-auth API client)
+        self.auth = HTTPBasicAuth(cfg["username"], cfg["password"])
         self.session = requests.Session()
-        self.session.auth = (cfg["username"], cfg["password"])
         # Qualys rejects API v2 calls that lack this header
         self.session.headers.update({"X-Requested-With": "Python-Qualys-VDI-Exporter"})
         self.session.verify = resolve_verify(cfg)
         if self.session.verify is False:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    def post(self, endpoint: str, payload: dict, max_retries: int = 6) -> ET.Element:
+    def login(self) -> None:
+        """Explicit session login so a bad URL / password / certificate fails here, with a clear message."""
+        self.post("/api/2.0/fo/session/",
+                  {"action": "login", "username": self.username, "password": self._password},
+                  use_auth=False)
+        if "QualysSession" not in self.session.cookies:
+            print("  (no session cookie returned - continuing with Basic auth on every call)")
+
+    def logout(self) -> None:
+        try:
+            self.post("/api/2.0/fo/session/", {"action": "logout"}, max_retries=0)
+        except Exception:
+            pass
+
+    def post(self, endpoint: str, payload, max_retries: int = 6, headers=None, use_auth: bool = True) -> ET.Element:
         url = f"{self.base_url}{endpoint}"
         resp = None
         for attempt in range(max_retries + 1):
-            resp = self.session.post(url, data=payload, timeout=(20, 900))
+            resp = self.session.post(url, data=payload, headers=headers,
+                                     auth=self.auth if use_auth else None, timeout=(20, 900))
             # 409 = concurrency / rate limit exceeded; wait as Qualys instructs
             if resp.status_code in (409, 429, 503) and attempt < max_retries:
                 wait = resp.headers.get("X-RateLimit-ToWait-Sec") or resp.headers.get("Retry-After")
@@ -194,6 +214,14 @@ class QualysClient:
 
         if root.tag == "SIMPLE_RETURN" and root.findtext(".//CODE"):
             raise QualysError(f"Qualys error {root.findtext('.//CODE')}: {root.findtext('.//TEXT', '')}")
+        return root
+
+    def qps_post(self, endpoint: str, body: bytes) -> ET.Element:
+        """Asset Management (QPS) REST call - XML in, XML out."""
+        root = self.post(endpoint, body, headers={"Content-Type": "application/xml", "Accept": "application/xml"})
+        code = root.findtext(".//responseCode", "")
+        if code and code != "SUCCESS":
+            raise QualysError(f"{endpoint}: {code} {root.findtext('.//errorMessage', '')}".strip())
         return root
 
 
@@ -236,38 +264,137 @@ def parse_server_list(text: str) -> list[str]:
 # --------------------------------------------------------------------------
 # Qualys data collection
 # --------------------------------------------------------------------------
-def resolve_servers(client: QualysClient, targets: list[str]):
-    """Maps input names / IPs to Qualys Host IDs. Returns (matched_hosts, unmatched_inputs)."""
-    wanted = {t.strip().lower() for t in targets if t.strip()}
+_IPV4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+HOST_LIST_EP = "/api/2.0/fo/asset/host/"
+QPS_SEARCH_EP = "/qps/rest/2.0/search/am/hostasset"
 
-    root = client.post(
-        "/api/2.0/fo/asset/host/",
-        {"action": "list", "details": "Basic", "truncation_limit": "0"},
-    )
 
-    matched, hit = {}, set()
-    for host in root.findall(".//HOST_LIST/HOST"):
-        host_id = host.findtext("ID", "").strip()
+def _name_sets(*values):
+    names = {v.strip().lower() for v in values if v and v.strip()}
+    return names, {n.split(".")[0] for n in names}
+
+
+def _match_level(target: str, names: set, shorts: set, ip: str) -> int:
+    """2 = exact (FQDN / NetBIOS / IP), 1 = short-name match, 0 = no match."""
+    if target in names or (ip and target == ip.lower()):
+        return 2
+    if not _IPV4.match(target) and target.split(".")[0] in shorts:
+        return 1
+    return 0
+
+
+def list_all_hosts(client: QualysClient) -> list:
+    payload = {"action": "list", "details": "Basic", "truncation_limit": "0"}
+    hosts = []
+    while True:
+        root = client.post(HOST_LIST_EP, payload)
+        hosts.extend(root.findall(".//HOST_LIST/HOST"))
+        m = re.search(r"id_min=(\d+)", root.findtext(".//WARNING/URL", "") or "")
+        if not m or payload.get("id_min") == m.group(1):
+            return hosts
+        payload = {**payload, "id_min": m.group(1)}
+
+
+def qps_lookup(client: QualysClient, target: str, log=print) -> tuple[list, list]:
+    """Looks a name up in the Asset Inventory. Returns (matches_with_vm_id, matches_without_vm_id)."""
+    if _IPV4.match(target):
+        searches = [("address", "EQUALS", target)]
+    else:
+        key = target.split(".")[0]
+        searches = [("name", "CONTAINS", key), ("dnsHostName", "CONTAINS", key), ("netbiosName", "CONTAINS", key)]
+
+    for field, op, value in searches:
+        root = ET.Element("ServiceRequest")
+        crit = ET.SubElement(ET.SubElement(root, "filters"), "Criteria", field=field, operator=op)
+        crit.text = value
+        ET.SubElement(ET.SubElement(root, "preferences"), "limitResults").text = "100"
+        try:
+            resp = client.qps_post(QPS_SEARCH_EP, ET.tostring(root, encoding="utf-8"))
+        except QualysError as exc:
+            log(f"    (asset inventory search on '{field}' failed: {exc})")
+            continue
+
+        found = []
+        for asset in resp.findall(".//HostAsset"):
+            names, shorts = _name_sets(asset.findtext("name", ""), asset.findtext("dnsHostName", ""),
+                                       asset.findtext("netbiosName", ""))
+            ip = (asset.findtext("address", "") or "").strip()
+            level = _match_level(target, names, shorts, ip)
+            if level:
+                found.append((level, {
+                    "host_id": (asset.findtext("qwebHostId", "") or "").strip(),
+                    "ip": ip,
+                    "dns": (asset.findtext("dnsHostName", "") or asset.findtext("name", "")).strip(),
+                    "netbios": (asset.findtext("netbiosName", "") or "").strip(),
+                    "os": "", "via": "Asset Inventory",
+                }))
+        if found:
+            best = max(level for level, _ in found)
+            hits = [h for level, h in found if level == best]
+            return [h for h in hits if h["host_id"]], [h for h in hits if not h["host_id"]]
+    return [], []
+
+
+def resolve_servers(client: QualysClient, targets: list[str], log=print):
+    """Maps input names / IPs to Qualys VM Host IDs. Returns (matched_hosts, unmatched_inputs)."""
+    wanted = list(dict.fromkeys(t.strip().lower() for t in targets if t.strip()))
+
+    host_elems = list_all_hosts(client)
+    with_dns = sum(1 for h in host_elems if (h.findtext("DNS", "") or h.findtext("DNS_DATA/FQDN", "")).strip())
+    with_nb = sum(1 for h in host_elems if h.findtext("NETBIOS", "").strip())
+    log(f"  Host List returned {len(host_elems)} hosts visible to this user "
+        f"({with_dns} with a DNS name, {with_nb} with a NetBIOS name).")
+    if not host_elems:
+        log("  !! Zero hosts visible: this user has no hosts in scope (asset groups / business unit) "
+            "or none have been scanned by VM yet.")
+
+    candidates = {t: [] for t in wanted}
+    known_names = set()
+    for host in host_elems:
         ip = host.findtext("IP", "").strip()
         dns = host.findtext("DNS", "").strip()
         netbios = host.findtext("NETBIOS", "").strip()
-        dns_host = host.findtext("DNS_DATA/HOSTNAME", "").strip()
         fqdn = host.findtext("DNS_DATA/FQDN", "").strip()
+        names, shorts = _name_sets(dns, netbios, host.findtext("DNS_DATA/HOSTNAME", ""), fqdn)
+        known_names |= names | shorts
+        info = {"host_id": host.findtext("ID", "").strip(), "ip": ip, "dns": dns or fqdn,
+                "netbios": netbios, "os": host.findtext("OS", "").strip(), "via": "VM Host List"}
+        for t in wanted:
+            level = _match_level(t, names, shorts, ip)
+            if level:
+                candidates[t].append((level, info))
 
-        names = {n.lower() for n in (dns, netbios, dns_host, fqdn) if n}
-        shorts = {n.split(".")[0] for n in names}
-        exact_keys = names | ({ip.lower()} if ip else set())
+    matched, unmatched = {}, []
+    for t in wanted:
+        if candidates[t]:
+            best = max(level for level, _ in candidates[t])
+            for level, info in candidates[t]:
+                if level == best:
+                    matched[info["host_id"]] = info
+        else:
+            unmatched.append(t)
 
-        for target in wanted:
-            # exact FQDN / NetBIOS / IP match, or short-name match only when the input has no dots
-            if target in exact_keys or ("." not in target and target in shorts):
-                matched[host_id] = {
-                    "host_id": host_id, "ip": ip, "dns": dns or fqdn,
-                    "netbios": netbios, "os": host.findtext("OS", "").strip(),
-                }
-                hit.add(target)
+    if unmatched:
+        log(f"  {len(unmatched)} name(s) not in the VM Host List - checking the Asset Inventory...")
+        still = []
+        for t in unmatched:
+            with_id, without_id = qps_lookup(client, t, log)
+            for info in with_id:
+                matched[info["host_id"]] = info
+            if not with_id:
+                still.append(t)
+                if without_id:
+                    log(f"  !! {t}: exists in the Asset Inventory but has no VM host ID "
+                        f"(never scanned by VM / no VM license on it), so there are no VM detections to export.")
+        unmatched = still
 
-    return matched, sorted(wanted - hit)
+    for t in unmatched:
+        close = difflib.get_close_matches(t, sorted(known_names), n=3, cutoff=0.6)
+        if close:
+            log(f"  ?? '{t}' not found - similar names in Qualys: {', '.join(close)}")
+    if unmatched and not matched and known_names:
+        log(f"  Example names Qualys holds (to compare formats): {', '.join(sorted(known_names)[:8])}")
+    return matched, sorted(unmatched)
 
 
 def fetch_detections(client: QualysClient, host_ids: list[str], include_ig: bool = False) -> list[dict]:
@@ -340,13 +467,22 @@ def is_vdi_related(row: pd.Series) -> bool:
 # --------------------------------------------------------------------------
 def run_export(cfg: dict, log=print) -> str:
     client = QualysClient(cfg)
+    log(f"\n[0/4] Logging in to {client.base_url} as {cfg['username']} ...")
+    client.login()
+    log("  Login successful.")
+    try:
+        return _export(client, cfg, log)
+    finally:
+        client.logout()
 
+
+def _export(client: QualysClient, cfg: dict, log) -> str:
     log("\n[1/4] Resolving server names in Qualys...")
-    matched, unmatched = resolve_servers(client, cfg["servers"])
+    matched, unmatched = resolve_servers(client, cfg["servers"], log)
     for h in matched.values():
-        log(f"  -> Matched: {h['dns'] or h['netbios']} (IP: {h['ip']}, ID: {h['host_id']})")
+        log(f"  -> Matched: {h['dns'] or h['netbios']} (IP: {h['ip']}, VM Host ID: {h['host_id']}, via {h['via']})")
     for name in unmatched:
-        log(f"  !! Not found in Qualys (not scanned yet, out of your scope, or different name): {name}")
+        log(f"  !! Not found in Qualys (not in this user's scope, not VM-scanned, or spelled differently): {name}")
     if not matched:
         raise QualysError("None of the entered servers were found in Qualys.")
 
@@ -539,9 +675,11 @@ def get_config_gui(defaults: dict):
         root.configure(cursor="watch")
         root.update()
         try:
-            QualysClient(cfg).post("/api/2.0/fo/asset/host/",
-                                   {"action": "list", "details": "Basic", "truncation_limit": "1"})
-            messagebox.showinfo("Connection OK", "Authenticated and the Host List API responded.")
+            c = QualysClient(cfg)
+            c.login()
+            c.post("/api/2.0/fo/asset/host/", {"action": "list", "details": "Basic", "truncation_limit": "1"})
+            c.logout()
+            messagebox.showinfo("Login successful", "Logged in and the Host List API responded.")
         except requests.exceptions.SSLError as exc:
             messagebox.showerror("SSL error", f"{exc}\n\nIf you are behind a proxy that inspects HTTPS, "
                                  "point 'CA cert' at your corporate root CA (Base-64 .pem/.crt).")
